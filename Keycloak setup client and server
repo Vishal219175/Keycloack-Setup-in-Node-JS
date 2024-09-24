@@ -1,0 +1,607 @@
+These files need to be added in client means hapi.js 
+1) Add a [...nextauth].js file 
+
+import NextAuth from 'next-auth';
+import CredentialsProvider from 'next-auth/providers/credentials';
+import axios from 'axios';
+
+export default NextAuth({
+  providers: [
+    CredentialsProvider({
+      name: 'Credentials',
+      credentials: {
+        username: { label: 'Username', type: 'text' },
+        password: { label: 'Password', type: 'password' },
+      },
+      async authorize(credentials) {
+        try {
+          const response = await axios.post(`${process.env.NEXTAUTH_URL}/api/auth/keycloak-login`, {
+            username: credentials.username,
+            password: credentials.password,
+          });
+
+          const user = response.data;
+
+          if (response.status === 200 && user) {
+          
+            const userInfoResponse = await axios.get(`${process.env.KEYCLOAK_ISSUER}/protocol/openid-connect/userinfo`, {
+              headers: {
+                Authorization: `Bearer ${user.access_token}`,
+              },
+            });
+
+            const userInfo = userInfoResponse.data;
+
+            if (userInfoResponse.status === 200 && userInfo) {
+              
+              return {
+                ...userInfo,
+                access_token: user.access_token,
+                refresh_token: user.refresh_token,
+                expires_in: user.expires_in,
+              };
+            }
+          }
+          return null;
+        } catch (error) {
+          console.error('Authorize error:', error);
+          return null;
+        }
+      },
+    }),
+  ],
+  session: {
+    strategy: 'jwt',
+    maxAge: 5 * 60 * 60,
+  },
+  pages: {
+    signIn: '/auth/Login',
+  },
+  callbacks: {
+    async jwt({ token, user }) {
+      if (user) {
+        token.accessToken = user.access_token;
+        token.refreshToken = user.refresh_token;
+        token.accessTokenExpires = Date.now() + user.expires_in * 1000;
+        token.user = user; 
+      }
+      if (Date.now() < token.accessTokenExpires) {
+        return token;
+      }
+      return await refreshAccessToken(token);
+    },
+    async session({ session, token }) {
+      session.accessToken = token.accessToken;
+      session.user = token.user; 
+      session.error = token.error;
+      return session;
+    },
+    async redirect({ url, baseUrl }) {
+      if (url.startsWith(baseUrl)) {
+        return url;
+      }
+      return baseUrl;
+    }
+  },
+});
+
+async function refreshAccessToken(token) {
+  try {
+    const url = `${process.env.KEYCLOAK_ISSUER}/protocol/openid-connect/token`;
+    const params = new URLSearchParams();
+    params.append('grant_type', 'refresh_token');
+    params.append('client_id', process.env.KEYCLOAK_CLIENT_ID);
+    params.append('client_secret', process.env.KEYCLOAK_CLIENT_SECRET);
+    params.append('refresh_token', token.refreshToken);
+ 
+    const response = await axios.post(url, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+ 
+    const refreshedTokens = response.data;
+ 
+    return {
+      ...token,
+      accessToken: refreshedTokens.access_token,
+      accessTokenExpires: Date.now() + refreshedTokens.expires_in * 1000,
+      refreshToken: refreshedTokens.refresh_token ?? token.refreshToken,
+    };
+  } catch (error) {
+    console.error('Error refreshing access token', error);
+    return {
+      ...token,
+      error: 'RefreshAccessTokenError',
+    };
+  }
+}
+
+2) Add a keycloack-login.js 
+
+import axios from 'axios';
+
+export default async function handler(req, res) {
+  if (req.method === 'POST') {
+    const { username, password } = req.body;
+
+    try {
+      const response = await axios.post(`${process.env.KEYCLOAK_ISSUER}/protocol/openid-connect/token`, new URLSearchParams({
+        grant_type: 'password',
+        client_id: process.env.KEYCLOAK_CLIENT_ID,
+        client_secret: process.env.KEYCLOAK_CLIENT_SECRET,
+        username: username,
+        password: password,
+        scope: 'openid profile email'
+      }), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+
+      const user = response.data;
+
+      if (user) {
+        res.status(200).json(user);
+      } else {
+        res.status(401).json({ error: 'Unauthorized' });
+      }
+    } catch (error) {
+      console.error('API route error:', error);
+      res.status(401).json({ error: 'Unauthorized' });
+    }
+  } else {
+    res.setHeader('Allow', ['POST']);
+    res.status(405).end(`Method ${req.method} Not Allowed`);
+  }
+}
+
+
+3) Create a axios instance :- axios.js will be file name 
+
+import axios from 'axios';
+import { getSession, signOut } from 'next-auth/react';
+import Router from 'next/router'; 
+const axiosInstance = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL, 
+  timeout: 20000, 
+});
+
+axiosInstance.interceptors.request.use(
+  async (config) => {
+    const session = await getSession();
+    if (session?.accessToken) {
+      config.headers.Authorization = `Bearer ${session.accessToken}`;
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+
+axiosInstance.interceptors.response.use(
+  (response) => {
+   
+    return response;
+  },
+  (error) => {
+    if (!error.response) {
+      console.log("Dispatching network error event");
+      window.dispatchEvent(new CustomEvent('globalError', { detail: 'Server is down. Please try again later.' }));
+      signOut({ callbackUrl: '/api/auth/signin' }); 
+      Router.push('/api/auth/signin');
+      return Promise.reject(new Error('Server is down. Please try again later.'));
+    }
+
+    if (error.response.status === 401) {
+      signOut({ callbackUrl: '/api/auth/signin' }); 
+      Router.push('/api/auth/signin');
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+export default axiosInstance;
+
+4) Add a auth.js 
+
+import { getSession } from 'next-auth/react';
+
+export async function requireAuthentication(context) {
+
+    const enforceAuth = process.env.NEXT_PUBLIC_ENFORCE_AUTH === 'true';
+
+    if (!enforceAuth) {
+      return {
+        props: {}, 
+      };
+    }
+  const session = await getSession(context);
+
+  if (!session) {
+    return {
+      redirect: {
+        destination: '/api/auth/signin', 
+        permanent: false,
+      },
+    };
+  }
+
+  return {
+    props: { session },
+  };
+}
+
+5) Add a Login.jsx
+
+import React, { useState } from 'react';
+import { Box, Button, TextField, Typography, Link } from '@mui/material';
+import { styled } from '@mui/system';
+import Image from 'next/image';
+import Logo from "../../../public/assets/icons/Logo.svg";
+import Background from "../../../public/assets/Images/loginBg.png";
+import { getProviders, signIn } from 'next-auth/react';
+import styles from "../../styles/Login.module.css";
+import { useRouter } from 'next/router';
+import "../../app/globals.css";
+
+const Root = styled(Box)({
+  display: 'flex',
+  justifyContent: 'center',
+  alignItems: 'center',
+  backgroundColor: '#f7f9fc',
+  backgroundImage: `url(${Background.src})`,
+  backgroundSize: 'cover',
+  backgroundPosition: 'center',
+  height: "100vh"
+});
+
+const LoginBox = styled(Box)({
+  width: '1000px',
+  height: '650px',
+  borderRadius: '8px',
+  boxShadow: '0px 4px 10px rgba(0, 0, 0, 0.1)',
+  backgroundColor: '#ffffff',
+  display: 'flex',
+  flexDirection: 'column',
+  justifyContent: 'space-between',
+  padding: '40px',
+  boxSizing: 'border-box',
+  marginTop: "-1%"
+});
+
+const Header = styled(Box)({
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  marginBottom: '20px',
+});
+
+const Content = styled(Box)({
+  display: 'flex',
+  flexDirection: 'column',
+  alignItems: 'center',
+  flexGrow: 1,
+});
+
+const Input = styled(TextField)({
+  width: '404px',
+  height: '44px',
+  marginBottom: '20px',
+});
+
+const StyledButton = styled(Button)({
+  width: '404px',
+  height: '44px',
+  marginTop: '20px',
+  marginBottom: '10px',
+});
+
+const Footer = styled(Typography)({
+  textAlign: 'right',
+});
+
+const Login = ({ providers }) => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoading(true); 
+    setError('');
+
+    const res = await signIn('credentials', {
+      redirect: false, 
+      username: email,
+      password,
+      callbackUrl: `${window.location.origin}/configWizard/Welcome`,
+      
+    });
+
+    if (res?.error) {
+      setError('Authentication failed');
+      setLoading(false); 
+    } else if (res?.url) {
+      router.push(res.url); 
+    }
+  };
+
+  return (
+    <Root>
+      <LoginBox>
+        <Header>
+          <Box>
+            <Image src={Logo} alt="Logo" className={styles.logoImage} />
+          </Box>
+        </Header>
+        <Content>
+          <Typography variant="h5" align="center" className={styles.welcomeText}>
+            Welcome to M12 Planner
+          </Typography>
+          <Typography variant="body1" align="center" className={styles.signInText}>
+            Sign in to get started with your workspaces
+          </Typography>
+          
+            <Input
+              variant="outlined"
+              required
+              id="email"
+              label="Business Email"
+              name="email"
+              autoComplete="email"
+              className={styles.emailBottom}
+              autoFocus
+              // value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+            <Input
+              variant="outlined"
+              required
+              name="password"
+              label="Password"
+              type="password"
+              id="password"
+              autoComplete="current-password"
+              // value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <Link href="#" variant="body2" display="block" className={styles.forgotPasswordLink}>
+              Forgot password?
+            </Link>
+            <StyledButton
+              type="button"
+              variant="contained"
+              color="primary"
+              className={styles.loginButton}
+              onClick={(e)=>{
+                handleLogin(e);
+              }}
+            >
+              Log in
+            </StyledButton>
+          <Typography
+            variant="body2"
+            align="center"
+            className={styles.termsText}
+          >
+            By signing up you create an account I accept Company’s{' '}
+            <Link href="#" variant="body2" className={styles.termsLink}>
+              Terms of Use
+            </Link>{' '}
+            and{' '}
+            <Link href="#" variant="body2" className={styles.termsLink}>
+              Privacy Policy
+            </Link>.
+          </Typography>
+        </Content>
+        <Footer variant="body2" color="textSecondary">
+          Copyright @ m12-planner.ai
+        </Footer>
+      </LoginBox>
+    </Root>
+  );
+};
+ 
+export async function getServerSideProps() {
+  const providers = await getProviders();
+  return {
+    props: { providers },
+  };
+}
+ 
+export default Login;
+
+6) .env file 
+
+NEXT_PUBLIC_API_URL=http://localhost:8181 // this is the host of backend  
+KEYCLOAK_CLIENT_ID=
+KEYCLOAK_CLIENT_SECRET=
+KEYCLOAK_ISSUER=
+NEXT_PUBLIC_ENFORCE_AUTH=true
+NEXTAUTH_URL=http://localhost:3000 // this is the host of frontend 
+NEXTAUTH_SECRET=
+
+Imp :- These files below need to be added in server means node.js 
+7) server.js 
+
+const Hapi = require("@hapi/hapi");
+const helloRoutes = require("./routes/helloRoutes");
+const welcomeRoutes = require("./routes/configWizard/welcomeRoutes");
+const factTablesRoutes = require("./routes/configWizard/factTableRoutes");
+const timeRoutes = require("./routes/configApplicationRoutes/timeRoutes");
+const countryRoutes = require("./routes/configApplicationRoutes/countryRoutes");
+const intOrgRoutes = require("./routes/configApplicationRoutes/intOrgRoutes");
+const rateRoutes = require("./routes/configApplicationRoutes/exchangeRateRoutes");
+const logger = require("./middleware/logger");
+const { setCorsHeaders } = require("hapi-cors-headers");
+const handleError = require("./middleware/errorHandler");
+const employeeRoutes = require("./routes/configApplicationRoutes/employeeRoute");
+const productRoutes = require("./routes/configApplicationRoutes/productRoutes");
+const measuresRoutes = require("./routes/configApplicationRoutes/measuresRoutes");
+const loginRoutes = require("./routes/authRoutes/loginRoutes")
+const authKeycloak = require('hapi-auth-keycloak');
+const userRoutes = require("./routes/authRoutes/userRoutes");
+const subscriptionRoutes = require("./routes/authRoutes/subscriptionRoutes");
+const summaryRoutes = require("./routes/configWizard/summaryRoutes");
+const metaDataRoutes = require("./routes/metaDataroutes");
+const categoriesRoutes = require("./routes/configWizard/categoriesRoutes");
+const rolesRoutes = require("./routes/authRoutes/rolesRoutes");
+const envConfig = require("./config/envConfig");
+const workbookWelcomeRoutes = require("./routes/workbook/workbookWelcomeRoutes");
+const addMeasureRoutes = require("./routes/workbook/addMeasureRoutes");
+const customCategoryRoutes = require("./routes/configApplicationRoutes/customCategoryRoutes");
+const planningRoutes = require("./routes/planning/planningRoutes");
+const fs = require('fs');
+const workbookRoutes = require("./routes/workbook/workbookRoutes");
+const userController = require("../server/controllers/auth/userController");
+const commonConfig = require("./config/commonConfig");
+
+const init = async () => {
+  const environment = process.env.NODE_ENV || 'dev';
+  const { port, host } = envConfig[environment];
+
+  const server = Hapi.server({
+    port: port,
+    host: host,
+  });
+  console.info(process.env.NODE_ENV + " - " + host);
+  const init = async () => {
+    await server.register(require("@hapi/hapi"));
+  };
+
+  const keycloakConfig = JSON.parse(fs.readFileSync('keycloak.json'));
+
+
+  await server.register({
+    plugin: authKeycloak,
+    options: {
+      realmUrl: keycloakConfig['auth-server-url'] + '/realms/' + keycloakConfig.realm,
+      clientId: keycloakConfig.resource,
+      secret: keycloakConfig.credentials ? keycloakConfig.credentials.secret : undefined,
+      publicKey: `-----BEGIN RSA PUBLIC KEY-----
+     // add key here 
+-----END RSA PUBLIC KEY-----`,
+      minTimeBetweenJwksRequests: 15,
+      cache: {},
+      userInfo: ['name', 'email']
+    }
+  });
+
+  // Define the authentication strategy
+  server.auth.strategy('keycloak-jwt', 'keycloak-jwt');
+
+
+  server.ext('onPreHandler', (request, h) => {
+    if (request.method === 'options') {
+      return h.continue;
+    }
+  
+    const token = request.headers.authorization ? request.headers.authorization.split(' ')[1] : null;
+    request.requestConstants = commonConfig.getConstants(request.method.toUpperCase(), token);
+    return h.continue;
+  });
+  
+  server.ext('onPreResponse', (request, h) => {
+    const response = request.response;
+    if (response.isBoom) {
+      return h.continue;
+    }
+    response.header("Access-Control-Allow-Origin", "*");
+    response.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+    return h.continue;
+  });
+
+  server.route({
+    method: "OPTIONS",
+    path: "/{any*}",
+    config: {
+      auth: false 
+    },
+    handler: (request, h) => {
+      const response = h.response();
+      response.header("Access-Control-Allow-Origin", "*");
+      response.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE");
+      response.header(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization"
+      );
+      return response;
+    },
+  });
+
+  server.ext("onRequest", logger);
+
+// Define public routes that do not require authentication
+const publicRoutes = [
+  ...loginRoutes,
+  {
+    method: 'GET',
+    path: '/api/user/activate-user',
+    handler: userController.activateUser
+  }
+];
+
+// Define secure routes that require authentication
+  const secureRoutes = [
+    ...welcomeRoutes,
+    ...timeRoutes,
+    ...categoriesRoutes,
+    ...helloRoutes,
+    ...countryRoutes,
+    ...intOrgRoutes,
+    ...rateRoutes,
+    ...employeeRoutes,
+    ...productRoutes,
+    ...measuresRoutes,
+    ...metaDataRoutes,
+    ...factTablesRoutes,
+    ...userRoutes.filter(route => route.path !== '/api/user/activate-user'), // Exclude activate-user route
+    ...summaryRoutes,
+    ...rolesRoutes,
+    ...workbookWelcomeRoutes,
+    ...addMeasureRoutes,
+    ...customCategoryRoutes,
+    ...subscriptionRoutes,
+    ...planningRoutes,
+    ...workbookRoutes
+  ];
+
+// Register secure routes with authentication
+  server.route(secureRoutes.map(route => {
+    route.options = route.options || {};
+    if (!publicRoutes.includes(route)) {
+      route.options.auth = 'keycloak-jwt';
+    }
+    return route;
+  }));
+
+// Register public routes without authentication
+  server.route(publicRoutes);
+
+  server.ext('onPreResponse', handleError);
+
+  await server.start();
+  console.log("Server running on %s", server.info.uri);
+};
+
+init().catch(err => {
+  console.error(err);
+  process.exit(1);
+});
+
+8) Add a keycloack.json 
+
+{
+    "realm": "",
+    "auth-server-url": "",
+    "ssl-required": "",
+    "resource": "",
+    "public-client": ,
+    "bearer-only": 
+   
+}
+
+  
+
