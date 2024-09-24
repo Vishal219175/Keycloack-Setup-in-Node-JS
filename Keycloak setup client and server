@@ -603,5 +603,13 @@ init().catch(err => {
    
 }
 
+9) Lastly add KeycloakInit.js 
+
+const Keycloak = require('hapi-auth-keycloak');
+const keycloakConfig = require('../config/keycloakConfig');
+
+const keycloak = new Keycloak(keycloakConfig);
+
+module.exports = keycloak;
   
 
