@@ -1,0 +1,41 @@
+Add this file :- azure-pipelines.yml
+
+pool:
+  vmImage: ubuntu-latest
+steps:
+- task: UseNode@1
+  inputs:
+    version: '20.x'
+  displayName: 'Install Node.js 20.x'
+ 
+- script: |
+    cd client
+    npm install
+    npm run build
+  displayName: 'npm install and build'
+  
+- script: |
+    cd server
+    npm install
+  displayName: 'Install NodeJS Dependencies'
+  
+- task: CopyFiles@2
+  inputs:
+      SourceFolder: 'client/.next'
+      Contents: '**'
+      TargetFolder: '$(Build.ArtifactStagingDirectory)/react'
+  displayName: 'Copy ReactJS Build Artifacts'
+
+- task: CopyFiles@2
+  inputs:
+    SourceFolder: 'server'
+    Contents: '**'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)/node'
+  displayName: 'Copy NodeJS Source Files'
+
+- task: PublishBuildArtifacts@1
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'm12planner01'
+    publishLocation: 'Container'
+  displayName: 'Publish Package'
